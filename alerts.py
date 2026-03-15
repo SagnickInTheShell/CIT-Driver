@@ -1,14 +1,16 @@
 import time
-import requests
 import datetime
+import requests
 from twilio.rest import Client
 
 import config
+from voice import VoiceAlert
 
 class AlertSystem:
     def __init__(self, serial_interface=None):
         self.serial = serial_interface
-        
+
+        # Twilio setup
         if config.TWILIO_SID != "your_sid" and config.TWILIO_TOKEN != "your_token":
             try:
                 self.twilio = Client(config.TWILIO_SID, config.TWILIO_TOKEN)
@@ -17,21 +19,47 @@ class AlertSystem:
                 self.twilio = None
         else:
             self.twilio = None
-            
+
+        # Voice engine
+        self.voice = VoiceAlert()
+        self.voice.start()
+
+        # SMS throttle
         self.last_sms_time = 0
+        self.last_warning_sms_time = 0
+
+        # Cancel window
         self.cancel_countdown_start = 0
         self.cancel_active = False
         self.cancel_remaining = 0
-        
+
+        # Escalating alert pattern
+        self.offence_count = 0
+        self.offence_window_start = 0
+        self.offence_window = 300  # 5 minutes
+
+        # Alert history (for dashboard)
+        self.alert_history = []  # list of (timestamp_str, message)
+        self.max_history = 20
+
     def _log(self, message):
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_line = f"[{timestamp}] {message}\n"
         print(log_line.strip())
         try:
-             with open("alerts_log.txt", "a") as f:
-                 f.write(log_line)
+            with open("alerts_log.txt", "a") as f:
+                f.write(log_line)
         except Exception:
-             pass
+            pass
+
+    def _add_history(self, message):
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        self.alert_history.append((timestamp, message))
+        if len(self.alert_history) > self.max_history:
+            self.alert_history = self.alert_history[-self.max_history:]
+
+    def get_history(self):
+        return list(self.alert_history[-5:])  # last 5 for dashboard
 
     def _send_command_to_esp32(self, cmd):
         if self.serial and hasattr(self.serial, 'write'):
@@ -39,144 +67,259 @@ class AlertSystem:
                 self.serial.write(f"{cmd}\n".encode('utf-8'))
             except Exception as e:
                 self._log(f"Failed to send to ESP32: {e}")
-        # Log regardless for simulation
         self._log(f"COMMAND to ESP32: {cmd}")
 
-    def _get_nearest_hospital(self, lat, lng):
+    # ─── Smart Hospital Selection ───
+
+    def _get_nearest_hospitals(self, lat, lng, count=3):
+        hospitals = []
         try:
-            # OpenStreetMap Nominatim API (Free, no API key needed)
-            url = f"https://nominatim.openstreetmap.org/search.php?q=hospital&format=jsonv2&lat={lat}&lon={lng}&radius=5000"
-            headers = {
-                'User-Agent': 'VitalDriveApp/1.0 (Student Hackathon Project)'
-            }
-            # 5 second timeout to prevent blocking the thread
+            url = (
+                f"https://nominatim.openstreetmap.org/search.php"
+                f"?q=hospital&format=jsonv2&lat={lat}&lon={lng}&limit={count}"
+            )
+            headers = {'User-Agent': 'VitalDriveApp/1.0 (Student Hackathon Project)'}
             response = requests.get(url, headers=headers, timeout=5)
+
             if response.status_code == 200:
                 data = response.json()
-                if data and len(data) > 0:
-                    name = data[0].get('display_name', 'Unknown Hospital').split(',')[0]
-                    
-                    # Approximate distance calculation in km
-                    h_lat = float(data[0]['lat'])
-                    h_lon = float(data[0]['lon'])
-                    # Simple euclidian approx (1 degree is approx 111km)
+                for entry in data[:count]:
+                    name = entry.get('display_name', 'Unknown Hospital').split(',')[0]
+                    h_lat = float(entry['lat'])
+                    h_lon = float(entry['lon'])
                     dist = ((lat - h_lat)**2 + (lng - h_lon)**2)**0.5 * 111
-                    return name, round(dist, 1)
+                    hospitals.append((name, round(dist, 1)))
+
         except Exception as e:
-            self._log(f"OSM Routing Error: {e}")
-            
-        return "Nearest Hospital", 0.0
+            self._log(f"OSM API Error: {e}")
+
+        if not hospitals:
+            hospitals = [("Nearest Hospital", 0.0)]
+
+        # Sort by distance and return
+        hospitals.sort(key=lambda x: x[1])
+        return hospitals
+
+    # ─── SMS ───
 
     def _send_sms(self, to_number, body):
         self._log(f"Sending SMS to {to_number}:\n{body}")
         if self.twilio:
             try:
                 message = self.twilio.messages.create(
-                    body=body,
-                    from_=config.TWILIO_FROM,
-                    to=to_number
+                    body=body, from_=config.TWILIO_FROM, to=to_number
                 )
-                self._log(f"SMS Successfully Sent! SID: {message.sid}")
+                self._log(f"SMS Sent! SID: {message.sid}")
             except Exception as e:
-                self._log(f"Twilio API Request Error: {e}")
+                self._log(f"Twilio Error: {e}")
         else:
             self._log("(SIMULATED SMS - Twilio not configured)")
+
+    # ─── Escalation Logic ───
+
+    def _track_offence(self):
+        now = time.time()
+
+        # Reset window after 5 minutes of no offences
+        if now - self.offence_window_start > self.offence_window:
+            self.offence_count = 0
+            self.offence_window_start = now
+
+        self.offence_count += 1
+        return self.offence_count
+
+    def _get_escalation_level(self, base_action):
+        count = self._track_offence()
+
+        if count >= 3:
+            # Third offence within 5 min → emergency mode
+            if "SOFT" in base_action:
+                return "BUZZ_LOUD"
+            elif "MEDIUM" in base_action:
+                return "BUZZ_MAX"
+            return base_action
+        elif count >= 2:
+            # Second offence → louder + voice
+            if "SOFT" in base_action:
+                return "BUZZ_MEDIUM"
+            elif "MEDIUM" in base_action:
+                return "BUZZ_LOUD"
+            return base_action
+        else:
+            return base_action
+
+    # ─── Main handler ───
 
     def handle(self, classification_result, button_pressed=False):
         state = classification_result.get("state", "NORMAL")
         action = classification_result.get("action_needed", "NONE")
-        
-        # Handle 10-second Cancellation Window Logic
+        risk_score = classification_result.get("risk_score", 0)
+        risk_level = classification_result.get("risk_level", "NORMAL")
+
+        # ─── Cancel window logic ───
         if button_pressed and self.cancel_active:
             self._log("ALERT CANCELLED BY DRIVER (Button Pressed)")
+            self._add_history("ALERT CANCELLED")
             self._send_command_to_esp32("RESET")
             self.cancel_active = False
             self.cancel_remaining = 0
             return
-            
+
         if self.cancel_active:
             elapsed = time.time() - self.cancel_countdown_start
             self.cancel_remaining = max(0, config.CANCEL_WINDOW_SECONDS - int(elapsed))
-            
+
             if elapsed >= config.CANCEL_WINDOW_SECONDS:
-                self._log("CANCEL WINDOW EXPIRED - ESCALATING TO EMERGENCY")
+                self._log("CANCEL WINDOW EXPIRED - ESCALATING")
+                self._add_history("CANCEL EXPIRED - ESCALATING")
                 self.cancel_active = False
                 self.cancel_remaining = 0
-                
-                # Logic implicitly states: If countdown reaches 0 → escalate to next level
-                if state == "EYES_CLOSED" or action == "LOUD_BUZZER":
+
+                if state in ["EYES_CLOSED", "MICROSLEEP"]:
                     state = "DRIVER_ASLEEP"
                     action = "MAX_BUZZER + CALL_DRIVER"
             else:
-                # Still in cancellation window, wait it out
                 return
 
-        # Start of countdown for EYES_CLOSED
-        if (state == "EYES_CLOSED" or action == "LOUD_BUZZER") and not self.cancel_active:
+        # Skip non-alert states
+        if state == "NORMAL" and action == "NONE":
+            return
+
+        # ─── Start countdown for EYES_CLOSED / MICROSLEEP ───
+        if state in ["EYES_CLOSED", "MICROSLEEP"] and "LOUD" in action and not self.cancel_active:
             self.cancel_active = True
             self.cancel_countdown_start = time.time()
             self.cancel_remaining = config.CANCEL_WINDOW_SECONDS
-            self._log(f"STARTING {config.CANCEL_WINDOW_SECONDS}s CANCELLATION COUNTDOWN.")
+            self._log(f"STARTING {config.CANCEL_WINDOW_SECONDS}s CANCELLATION COUNTDOWN")
+            self._add_history(f"{state} - {config.CANCEL_WINDOW_SECONDS}s COUNTDOWN")
             self._send_command_to_esp32("BUZZ_LOUD")
+            self.voice.speak(state)
             return
 
-        # Send Hardware Commands
+        # ─── Hardware buzzer commands with escalation ───
         if action == "SOFT_BUZZER":
-            self._send_command_to_esp32("BUZZ_SOFT")
+            escalated = self._get_escalation_level("BUZZ_SOFT")
+            self._send_command_to_esp32(escalated)
+            self._add_history(f"{state} detected")
+            self.voice.speak(state)
+
         elif action == "MEDIUM_BUZZER":
-            self._send_command_to_esp32("BUZZ_MEDIUM")
+            escalated = self._get_escalation_level("BUZZ_MEDIUM")
+            self._send_command_to_esp32(escalated)
+            self._add_history(f"{state} detected")
+            self.voice.speak(state)
+
         elif "MAX_BUZZER" in action:
             self._send_command_to_esp32("BUZZ_MAX")
             self._send_command_to_esp32("VIBRATE_MAX")
+            self._add_history(f"{state} - MAX ALERT")
+            self.voice.speak(state)
 
-        # Throttling SMS logic (Never send duplicate SMS within 5 minutes)
+        # ─── Pre-Emergency Warning SMS (risk score 7-8) ───
         current_time = time.time()
+        if risk_score >= config.PRE_EMERGENCY_SCORE and risk_level == "HIGH_ALERT":
+            if (current_time - self.last_warning_sms_time) > 300:
+                lat = classification_result.get("lat", 0.0)
+                lng = classification_result.get("lng", 0.0)
+                body = (
+                    f"VitalDrive Warning: Driver showing signs of fatigue.\n"
+                    f"Risk Score: {risk_score}/15\n"
+                    f"Monitoring closely.\n"
+                    f"Location: https://maps.google.com/?q={lat},{lng}"
+                )
+                self._send_sms(config.EMERGENCY_CONTACT, body)
+                self._add_history("WARNING SMS sent to contact")
+                self.last_warning_sms_time = current_time
+
+        # ─── Emergency SMS (throttled: 5 min cooldown) ───
         if "SMS" in action or "CALL" in action:
             if (current_time - self.last_sms_time) < 300:
-                # Already sent an emergency SMS within the last 5 minutes
                 return
 
-        # Prepare Text Payload Data
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         lat = classification_result.get("lat", 0.0)
         lng = classification_result.get("lng", 0.0)
         hr = classification_result.get("hr", 0)
         spo2 = classification_result.get("spo2", 0)
 
-        # Handle SMS Generation
         if state == "CARDIAC_EMERGENCY":
-            hosp_name, dist = self._get_nearest_hospital(lat, lng)
-            body = (f"CARDIAC EMERGENCY - VitalDrive Alert\n"
-                    f"Patient: Driver\n"
-                    f"HR: {hr} BPM | SpO2: {spo2}%\n"
-                    f"ECG: Irregular pattern detected\n"
-                    f"Location: https://maps.google.com/?q={lat},{lng}\n"
-                    f"Nearest Hospital: {hosp_name} ({dist}km)\n"
-                    f"Time: {timestamp}")
+            hospitals = self._get_nearest_hospitals(lat, lng, count=3)
+            primary = hospitals[0]
+            hospital_lines = "\n".join([f"  {i+1}. {h[0]} ({h[1]}km)" for i, h in enumerate(hospitals)])
+
+            body = (
+                f"CARDIAC EMERGENCY - VitalDrive Alert\n"
+                f"Patient: Driver\n"
+                f"HR: {hr} BPM | SpO2: {spo2}%\n"
+                f"ECG: Irregular pattern detected\n"
+                f"Location: https://maps.google.com/?q={lat},{lng}\n"
+                f"Nearest Hospitals:\n{hospital_lines}\n"
+                f"Time: {timestamp}"
+            )
             self._send_sms(config.HOSPITAL_CONTACT, body)
             self._send_sms(config.EMERGENCY_CONTACT, body)
+            self._add_history("CARDIAC EMERGENCY - SMS sent")
+            self.voice.speak(state)
             self.last_sms_time = current_time
-            
+
         elif state in ["ACCIDENT", "CARDIAC_CAUSED_CRASH"]:
-            body = (f"CRASH EMERGENCY - VitalDrive Alert\n"
-                    f"High impact detected\n"
-                    f"HR: {hr} BPM | SpO2: {spo2}%\n"
-                    f"Location: https://maps.google.com/?q={lat},{lng}\n"
-                    f"Time: {timestamp}")
+            hospitals = self._get_nearest_hospitals(lat, lng, count=3)
+            hospital_lines = "\n".join([f"  {i+1}. {h[0]} ({h[1]}km)" for i, h in enumerate(hospitals)])
+
+            body = (
+                f"CRASH EMERGENCY - VitalDrive Alert\n"
+                f"High impact detected\n"
+                f"HR: {hr} BPM | SpO2: {spo2}%\n"
+                f"Location: https://maps.google.com/?q={lat},{lng}\n"
+                f"Nearest Hospitals:\n{hospital_lines}\n"
+                f"Time: {timestamp}"
+            )
             self._send_sms(config.EMERGENCY_CONTACT, body)
+            self._add_history("CRASH EMERGENCY - SMS sent")
+            self.voice.speak(state)
             self.last_sms_time = current_time
-            
+
         elif state == "MEDICAL_SHOCK":
-            body = (f"CRITICAL MEDICAL SHOCK - VitalDrive Alert\n"
-                    f"Driver vitals crashed below critical limits.\n"
-                    f"HR: {hr} BPM | SpO2: {spo2}%\n"
-                    f"Location: https://maps.google.com/?q={lat},{lng}\n"
-                    f"Time: {timestamp}")
+            hospitals = self._get_nearest_hospitals(lat, lng, count=3)
+            hospital_lines = "\n".join([f"  {i+1}. {h[0]} ({h[1]}km)" for i, h in enumerate(hospitals)])
+
+            body = (
+                f"CRITICAL MEDICAL SHOCK - VitalDrive Alert\n"
+                f"Driver vitals crashed below critical limits.\n"
+                f"HR: {hr} BPM | SpO2: {spo2}%\n"
+                f"Location: https://maps.google.com/?q={lat},{lng}\n"
+                f"Nearest Hospitals:\n{hospital_lines}\n"
+                f"Time: {timestamp}"
+            )
             self._send_sms(config.HOSPITAL_CONTACT, body)
             self._send_sms(config.EMERGENCY_CONTACT, body)
+            self._add_history("MEDICAL SHOCK - SMS sent")
+            self.voice.speak(state)
             self.last_sms_time = current_time
 
         elif state == "DRIVER_ASLEEP":
             self._log("Calling Emergency Contact... (Simulated Phone Call)")
-            # You could insert Twilio Call client logic here
+            self._add_history("DRIVER ASLEEP - Calling contact")
+            self.voice.speak(state)
             self.last_sms_time = current_time
+
+        elif state == "RISK_EMERGENCY":
+            hospitals = self._get_nearest_hospitals(lat, lng, count=3)
+            hospital_lines = "\n".join([f"  {i+1}. {h[0]} ({h[1]}km)" for i, h in enumerate(hospitals)])
+
+            body = (
+                f"RISK EMERGENCY - VitalDrive Alert\n"
+                f"Multiple risk factors detected simultaneously.\n"
+                f"Risk Score: {classification_result.get('risk_score', 0)}\n"
+                f"HR: {hr} BPM | SpO2: {spo2}%\n"
+                f"Location: https://maps.google.com/?q={lat},{lng}\n"
+                f"Nearest Hospitals:\n{hospital_lines}\n"
+                f"Time: {timestamp}"
+            )
+            self._send_sms(config.HOSPITAL_CONTACT, body)
+            self._send_sms(config.EMERGENCY_CONTACT, body)
+            self._add_history("RISK EMERGENCY - SMS sent")
+            self.last_sms_time = current_time
+
+    def stop(self):
+        self.voice.stop()
