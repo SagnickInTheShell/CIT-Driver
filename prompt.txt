@@ -1,0 +1,307 @@
+I am building VitalDrive AI — an in-vehicle driver monitoring and 
+cardiac emergency detection system for a college hackathon.
+
+HARDWARE SETUP:
+- ESP32-CAM connected via USB serial to laptop
+- AD8232 ECG sensor connected to ESP32
+- MAX30102 SpO2 + heart rate sensor connected to ESP32
+- Neo-6M GPS connected to ESP32
+- Buzzer, vibration motor, push button connected to ESP32
+- ESP32 sends sensor data via serial USB
+
+CAMERA SETUP (flexible — handle both):
+- PRIMARY: ESP32-CAM WiFi stream via cv2.VideoCapture("http://IP/stream")
+- FALLBACK: Laptop webcam via cv2.VideoCapture(0, cv2.CAP_DSHOW)
+- config.py has a setting USE_ESP32_CAM = True/False
+- If ESP32-CAM stream fails, automatically fall back to webcam
+- This way system works during testing AND final demo
+
+BUILD ALL 7 FILES:
+
+═══════════════════════════════════════
+FILE 1 — config.py
+═══════════════════════════════════════
+# Camera
+USE_ESP32_CAM = False  # switch to True when ECE team gives IP
+ESP32_CAM_URL = "http://192.168.1.100/stream"  # placeholder IP
+
+# Serial
+SERIAL_PORT = "AUTO"  # auto detect COM port
+BAUD_RATE = 115200
+SIMULATION_MODE = True  # True when ESP32 not connected
+
+# Vision thresholds
+EAR_THRESHOLD = 0.25
+DROWSY_SECONDS = 2.0
+HEAD_ANGLE_THRESHOLD = 30
+
+# Health thresholds
+HR_MIN = 40
+HR_MAX = 120
+SPO2_MIN = 90
+SPO2_CRITICAL = 85
+ECG_IRREGULARITY_THRESHOLD = 0.7
+
+# Alert timings
+CANCEL_WINDOW_SECONDS = 10
+ESCALATION_DELAY = 5
+
+# Twilio (placeholders)
+TWILIO_SID = "your_sid"
+TWILIO_TOKEN = "your_token"
+TWILIO_FROM = "+1xxxxxxxxxx"
+EMERGENCY_CONTACT = "+91xxxxxxxxxx"
+HOSPITAL_CONTACT = "+91xxxxxxxxxx"
+
+═══════════════════════════════════════
+FILE 2 — vision.py
+═══════════════════════════════════════
+IMPORTANT MEDIAPIPE NOTE:
+- Version is 0.10.32
+- MUST use mp.tasks API
+- NEVER use mp.solutions — it does not exist in this version
+- Uses face_landmarker.task model file (already downloaded)
+
+Camera logic:
+- If USE_ESP32_CAM is True → open ESP32 stream URL
+- If USE_ESP32_CAM is False → open laptop webcam
+- If stream fails → automatically fall back to webcam
+- Camera opens with warmup loop (read 30 frames before processing)
+  because Lenovo laptop camera needs warmup
+
+Eye landmarks:
+LEFT_EYE  = [362, 385, 387, 263, 373, 380]
+RIGHT_EYE = [33,  160, 158, 133, 153, 144]
+
+Detects and returns one of:
+- ALERT (eyes open, head straight)
+- HEAD_DROOPING (head angle > 30 degrees)
+- EYES_CLOSING (EAR below 0.25)
+- EYES_CLOSED (EAR below 0.25 for 2+ seconds)
+- NO_FACE (face not detected)
+
+Runs in background thread.
+Returns latest status via get_status() method.
+Never crashes if camera disconnects.
+
+═══════════════════════════════════════
+FILE 3 — sensors.py
+═══════════════════════════════════════
+Reads from ESP32 via USB serial.
+
+Handle ALL these incoming formats:
+- "HR:82,SPO2:97,ECG:0.023,LAT:12.97,LNG:77.59"
+- "82,97,0.023,12.97,77.59"
+- JSON: {"hr":82,"spo2":97,"ecg":0.023,"lat":12.97,"lng":77.59}
+- Partial data: "HR:82,SPO2:97" (GPS not ready yet)
+
+Always returns clean dictionary:
+{
+  "hr": 82,
+  "spo2": 97,
+  "ecg": 0.023,
+  "lat": 12.9716,
+  "lng": 77.5946,
+  "gps_available": True,
+  "status": "ok"
+}
+
+SIMULATION MODE (when SIMULATION_MODE = True in config):
+- Generate realistic fake values
+- HR oscillates between 70-85
+- SpO2 stays 96-99
+- ECG generates realistic waveform values
+- GPS uses fixed Bangalore coordinates
+- Simulation can inject emergencies for demo:
+  inject_cardiac_emergency() method
+  inject_accident() method
+
+Auto detect COM port.
+Run in background thread.
+Never crash if ESP32 disconnects.
+If disconnected mid-run → switch to last known values.
+
+═══════════════════════════════════════
+FILE 4 — logic.py
+═══════════════════════════════════════
+Brain of the system.
+Takes vision status + sensor dictionary.
+Returns classified emergency state.
+
+EXACTLY 8 CASES:
+
+CASE 1 — HEAD_DROOPING
+Condition: vision = HEAD_DROOPING, vitals normal
+Action needed: SOFT_BUZZER
+
+CASE 2 — EYES_CLOSING
+Condition: vision = EYES_CLOSING, vitals normal
+Action needed: MEDIUM_BUZZER
+
+CASE 3 — EYES_CLOSED
+Condition: vision = EYES_CLOSED, vitals normal
+Action needed: LOUD_BUZZER + start 10s cancel countdown
+
+CASE 4 — DRIVER_ASLEEP
+Condition: EYES_CLOSED for 10+ seconds, vitals completely normal
+Action needed: MAX_BUZZER + CALL_DRIVER
+
+CASE 5 — CARDIAC_EMERGENCY
+Condition: ECG irregular + SpO2 dropping + HR abnormal
+Action needed: HOSPITAL_SMS
+
+CASE 6 — ACCIDENT
+Condition: sudden GPS coordinate spike + vitals spiking
++ driver unresponsive
+Action needed: HOSPITAL_SMS
+
+CASE 7 — CARDIAC_CAUSED_CRASH
+Condition: CARDIAC_EMERGENCY detected, then ACCIDENT 
+within 30 seconds
+Action needed: COMBINED_HOSPITAL_SMS
+
+CASE 8 — MEDICAL_SHOCK
+Condition: SpO2 below 85% + HR crashing below 40
+Action needed: CRITICAL_SMS
+
+Returns:
+{
+  "state": "CARDIAC_EMERGENCY",
+  "confidence": 0.91,
+  "vision_input": "EYES_CLOSED",
+  "hr": 142,
+  "spo2": 79,
+  "ecg": 0.89,
+  "lat": 12.97,
+  "lng": 77.59,
+  "action_needed": "HOSPITAL_SMS",
+  "cancel_countdown": None
+}
+
+═══════════════════════════════════════
+FILE 5 — alerts.py
+═══════════════════════════════════════
+Responds to logic.py output.
+
+BUZZER/VIBRATION COMMANDS:
+Send these strings back to ESP32 via serial:
+- "BUZZ_SOFT"
+- "BUZZ_MEDIUM"  
+- "BUZZ_LOUD"
+- "BUZZ_MAX"
+- "VIBRATE_MILD"
+- "VIBRATE_STRONG"
+- "VIBRATE_MAX"
+- "RESET"
+
+SMS FORMAT for CARDIAC_EMERGENCY:
+"CARDIAC EMERGENCY - VitalDrive Alert
+Patient: Driver
+HR: {hr} BPM | SpO2: {spo2}%
+ECG: Irregular pattern detected
+Location: https://maps.google.com/?q={lat},{lng}
+Nearest Hospital: {hospital} ({distance}km)
+Time: {timestamp}"
+
+SMS FORMAT for ACCIDENT:
+"CRASH EMERGENCY - VitalDrive Alert
+High impact detected
+HR: {hr} BPM | SpO2: {spo2}%
+Location: https://maps.google.com/?q={lat},{lng}
+Time: {timestamp}"
+
+Find nearest hospital using OpenStreetMap 
+Nominatim API (free, no API key needed).
+
+10 second cancel window:
+- Start countdown when EYES_CLOSED detected
+- If ESP32 sends "BTN_PRESSED" via serial → cancel alert
+- If countdown reaches 0 → escalate to next level
+
+Never send duplicate SMS within 5 minutes.
+Log all alerts to alerts_log.txt
+
+═══════════════════════════════════════
+FILE 6 — dashboard.py
+═══════════════════════════════════════
+Live monitoring display using tkinter 
+(NOT OpenCV window — tkinter is more stable on Windows).
+
+Layout:
+LEFT SIDE:
+- Live camera feed (640x480)
+- Face landmarks drawn on feed
+- Driver status text below feed
+
+RIGHT SIDE TOP:
+- Heart Rate: big number with colour
+  green = normal, orange = warning, red = critical
+- SpO2: big number with colour
+- GPS coordinates
+
+RIGHT SIDE MIDDLE:
+- Scrolling ECG graph (last 5 seconds of data)
+- Updates every 100ms
+
+RIGHT SIDE BOTTOM:
+- Current alert state in large text
+- Cancel countdown timer if active
+- Cancel button (simulates button press)
+
+COLOUR CODING:
+- ALERT state → green background
+- WARNING states → orange background  
+- EMERGENCY states → red flashing background
+
+═══════════════════════════════════════
+FILE 7 — main.py
+═══════════════════════════════════════
+Starts and coordinates everything.
+
+Startup sequence:
+1. Load config.py
+2. Print system status (simulation mode or live)
+3. Start sensors thread
+4. Wait 2 seconds for sensors to initialise
+5. Start vision thread
+6. Wait 1 second for camera to initialise
+7. Start dashboard
+8. Enter main loop:
+   - Get vision.get_status()
+   - Get sensors.get_data()
+   - Pass both to logic.classify()
+   - Pass result to alerts.handle()
+   - Update dashboard
+   - Run at 10Hz (every 100ms)
+9. On quit (Q key or window close):
+   - Send "RESET" to ESP32
+   - Stop all threads cleanly
+   - Save final log
+
+DEMO MODE (for hackathon presentation):
+Add demo_mode() function that:
+- Runs normal for 10 seconds
+- Then simulates eyes closing
+- Then simulates cardiac emergency
+- Shows full alert pipeline automatically
+- Good for when judges want to see it work
+
+═══════════════════════════════════════
+TECHNICAL REQUIREMENTS:
+═══════════════════════════════════════
+- Python 3.13
+- Windows 11
+- MediaPipe 0.10.32 — mp.tasks API ONLY
+- face_landmarker.task model already in project folder
+- OpenCV with cv2.CAP_DSHOW
+- pyserial, twilio, scipy installed
+- tkinter (built into Python)
+- Every file testable independently
+- Simulation mode works without any hardware
+- System never crashes if component fails
+- All errors logged to error_log.txt
+
+BUILD ONE FILE AT A TIME.
+Start with config.py.
+Show complete code for each file.
+After each file ask me to confirm before next file.
