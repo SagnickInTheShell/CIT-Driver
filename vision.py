@@ -123,8 +123,9 @@ class VisionMonitor:
                     cap.release()
                     cap = self._open_camera()
                     continue
-                    
-                self.current_frame = frame.copy()
+                
+                # We need a copy of the frame to draw on
+                display_frame = frame.copy()
                 
                 # Convert BGR to RGB for Mediapipe
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -133,37 +134,57 @@ class VisionMonitor:
                 # Process the frame with mp.tasks API
                 result = self.detector.detect(mp_image)
                 
+                avg_ear = 0.0
+                head_angle = 0.0
+
                 if not result.face_landmarks:
                     self.status = "NO_FACE"
                     self.eyes_closed_start_time = None
-                    continue
-                    
-                landmarks = result.face_landmarks[0]
-                transform_matrix = result.facial_transformation_matrixes[0]
-                
-                # Calculate metrics
-                left_ear = self._calculate_ear(landmarks, LEFT_EYE)
-                right_ear = self._calculate_ear(landmarks, RIGHT_EYE)
-                avg_ear = (left_ear + right_ear) / 2.0
-                head_angle = self._calculate_head_angle(transform_matrix)
-                
-                # Classify based on conditions
-                if head_angle > config.HEAD_ANGLE_THRESHOLD:
-                    self.status = "HEAD_DROOPING"
-                    self.eyes_closed_start_time = None
-                elif avg_ear < config.EAR_THRESHOLD:
-                    if self.eyes_closed_start_time is None:
-                        self.eyes_closed_start_time = time.time()
-                    
-                    closed_duration = time.time() - self.eyes_closed_start_time
-                    if closed_duration >= config.DROWSY_SECONDS:
-                        self.status = "EYES_CLOSED"
-                    else:
-                        self.status = "EYES_CLOSING"
                 else:
-                    self.status = "ALERT"
-                    self.eyes_closed_start_time = None
+                    landmarks = result.face_landmarks[0]
+                    transform_matrix = result.facial_transformation_matrixes[0]
                     
+                    # Calculate metrics
+                    left_ear = self._calculate_ear(landmarks, LEFT_EYE)
+                    right_ear = self._calculate_ear(landmarks, RIGHT_EYE)
+                    avg_ear = (left_ear + right_ear) / 2.0
+                    head_angle = self._calculate_head_angle(transform_matrix)
+                    
+                    # Classify based on conditions
+                    if head_angle > config.HEAD_ANGLE_THRESHOLD:
+                        self.status = "HEAD_DROOPING"
+                        self.eyes_closed_start_time = None
+                    elif avg_ear < config.EAR_THRESHOLD:
+                        if self.eyes_closed_start_time is None:
+                            self.eyes_closed_start_time = time.time()
+                        
+                        closed_duration = time.time() - self.eyes_closed_start_time
+                        if closed_duration >= config.DROWSY_SECONDS:
+                            self.status = "EYES_CLOSED"
+                        else:
+                            self.status = "EYES_CLOSING"
+                    else:
+                        self.status = "ALERT"
+                        self.eyes_closed_start_time = None
+
+                # Drawing on the frame
+                # Determine color based on status
+                if self.status == "ALERT":
+                    color = (0, 255, 0) # Green
+                elif self.status in ["HEAD_DROOPING", "EYES_CLOSING"]:
+                    color = (0, 165, 255) # Orange
+                elif self.status in ["EYES_CLOSED", "NO_FACE"]:
+                    color = (0, 0, 255) # Red
+                else:
+                    color = (255, 255, 255) # White fallback
+                
+                # Add text to display frame
+                cv2.putText(display_frame, f"EAR: {avg_ear:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(display_frame, f"Angle: {head_angle:.1f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(display_frame, f"Status: {self.status}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                
+                self.current_frame = display_frame
+
             except Exception as e:
                 # Log error and continue to prevent thread crash
                 with open("error_log.txt", "a") as f:
