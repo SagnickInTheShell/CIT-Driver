@@ -38,6 +38,16 @@ class AlertSystem:
         self.offence_window_start = 0
         self.offence_window = 300  # 5 minutes
 
+        # Buzzer command throttle (prevents spam)
+        self.last_command = None
+        self.last_command_time = 0
+        self.command_cooldown = 3  # seconds between identical commands
+
+        # State handling throttle
+        self.last_handled_state = None
+        self.last_handle_time = 0
+        self.handle_cooldown = 3  # seconds between re-handling same state
+
         # Alert history (for dashboard)
         self.alert_history = []  # list of (timestamp_str, message)
         self.max_history = 20
@@ -62,6 +72,15 @@ class AlertSystem:
         return list(self.alert_history[-5:])  # last 5 for dashboard
 
     def _send_command_to_esp32(self, cmd):
+        now = time.time()
+
+        # Throttle: skip if same command was sent within cooldown (RESET always goes through)
+        if cmd != "RESET" and cmd == self.last_command and (now - self.last_command_time) < self.command_cooldown:
+            return
+
+        self.last_command = cmd
+        self.last_command_time = now
+
         if self.serial and hasattr(self.serial, 'write'):
             try:
                 self.serial.write(f"{cmd}\n".encode('utf-8'))
@@ -184,6 +203,16 @@ class AlertSystem:
         # Skip non-alert states
         if state == "NORMAL" and action == "NONE":
             return
+
+        # Throttle: don't re-handle the same non-emergency state within cooldown
+        emergency_states = {"CARDIAC_EMERGENCY", "ACCIDENT", "CARDIAC_CAUSED_CRASH",
+                            "MEDICAL_SHOCK", "DRIVER_ASLEEP", "RISK_EMERGENCY"}
+        now = time.time()
+        if state not in emergency_states:
+            if state == self.last_handled_state and (now - self.last_handle_time) < self.handle_cooldown:
+                return
+        self.last_handled_state = state
+        self.last_handle_time = now
 
         # ─── Start countdown for EYES_CLOSED / MICROSLEEP ───
         if state in ["EYES_CLOSED", "MICROSLEEP"] and "LOUD" in action and not self.cancel_active:
