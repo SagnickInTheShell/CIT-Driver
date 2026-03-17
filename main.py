@@ -3,250 +3,257 @@ import sys
 import datetime
 import threading
 
+import streamlit as st
+from streamlit_autorefresh import st_autorefresh
+
 import config
 from vision import VisionMonitor
 from sensors import SensorMonitor
 from logic import LogicController
 from alerts import AlertSystem
-from dashboard import Dashboard
+from dashboard import render_dashboard
+
+# ═══════════════════════════════════════
+# DEMO STAGES
+# ═══════════════════════════════════════
 
 DEMO_STAGES = [
-    # (start_s, end_s, label, vision_override, sensor_action)
-    (0,   8,  "Stage 1/8 — Normal Driving",         None,            None),
-    (8,  12,  "Stage 2/8 — Yawning Detected",       "YAWNING",       None),
-    (12, 16,  "Stage 3/8 — Eyes Closing",            "EYES_CLOSING",  None),
-    (16, 20,  "Stage 4/8 — Eyes Closed + Alarm",     "EYES_CLOSED",   None),
-    (20, 25,  "Stage 5/8 — Driver Unresponsive",     "EYES_CLOSED",   None),
-    (25, 30,  "Stage 6/8 — ECG Irregular, SpO2 Dropping", None,      "PRE_CARDIAC"),
-    (30, 35,  "Stage 7/8 — CARDIAC EMERGENCY",       None,           "CARDIAC"),
-    (35, 40,  "Stage 8/8 — SMS Sent, Hospital Notified", None,       None),
+    (0,   8,  "Stage 1/8 — Normal Driving",              None,            None),
+    (8,  12,  "Stage 2/8 — Yawning Detected",            "YAWNING",       None),
+    (12, 16,  "Stage 3/8 — Eyes Closing",                 "EYES_CLOSING",  None),
+    (16, 20,  "Stage 4/8 — Eyes Closed + Alarm",          "EYES_CLOSED",   None),
+    (20, 25,  "Stage 5/8 — Driver Unresponsive",          "EYES_CLOSED",   None),
+    (25, 30,  "Stage 6/8 — ECG Irregular, SpO2 Dropping", None,           "PRE_CARDIAC"),
+    (30, 35,  "Stage 7/8 — CARDIAC EMERGENCY",            None,           "CARDIAC"),
+    (35, 40,  "Stage 8/8 — SMS Sent, Hospital Notified",  None,           None),
 ]
 
-class AppSystem:
-    def __init__(self):
-        self.start_time = time.time()
-        self.demo_active = False
-        self.demo_cardiac_injected = False
-        self.demo_pre_cardiac_injected = False
 
-        print("═" * 50)
-        print("   VITALDRIVE AI — INITIALIZING")
-        print("═" * 50)
-        print(f"  Simulation Mode : {config.SIMULATION_MODE}")
-        print(f"  Camera Mode     : {'ESP32-CAM' if config.USE_ESP32_CAM else 'LOCAL WEBCAM'}")
-        print(f"  Voice Enabled   : {config.VOICE_ENABLED}")
-        print("═" * 50)
+def get_demo_state(elapsed):
+    for start, end, label, vis_override, sensor_action in DEMO_STAGES:
+        if start <= elapsed < end:
+            return label, vis_override, sensor_action
+    return "DEMO COMPLETE", None, None
 
-        # Initialize components
-        self.sensors = SensorMonitor()
-        self.vision = VisionMonitor()
-        self.logic = LogicController()
 
-        # Start sensors
-        print("  [1/4] Starting sensor thread...")
-        self.sensors.start()
-        time.sleep(2)
+# ═══════════════════════════════════════
+# SAFETY SCORE CALCULATOR
+# ═══════════════════════════════════════
 
-        # Alerts (includes voice engine)
-        print("  [2/4] Starting alert system...")
-        self.alerts = AlertSystem(serial_interface=None)
+SAFETY_PENALTIES = {
+    "YAWNING": 1, "DISTRACTED": 2, "HEAD_DROOPING": 2,
+    "EYES_CLOSING": 3, "EYES_CLOSED": 5, "MICROSLEEP": 8,
+    "DRIVER_ASLEEP": 10, "CARDIAC_EMERGENCY": 15,
+    "ACCIDENT": 20, "MEDICAL_SHOCK": 20,
+}
 
-        # Start vision
-        print("  [3/4] Starting camera/vision thread...")
-        self.vision.start()
-        time.sleep(1)
 
-        # Dashboard
-        print("  [4/4] Starting dashboard...")
-        self.dashboard = Dashboard(
-            bg_update_callback=self.update_loop,
-            cancel_callback=self.on_driver_cancel
-        )
+def update_safety_score(shared_state, state):
+    penalty = SAFETY_PENALTIES.get(state, 0)
+    if penalty > 0:
+        shared_state["safety_score"] = max(0, shared_state["safety_score"] - penalty)
+        shared_state["last_clean_time"] = time.time()
+    else:
+        if (time.time() - shared_state.get("last_clean_time", time.time())) > 300:
+            shared_state["safety_score"] = min(100, shared_state["safety_score"] + 1)
 
-        # Keyboard shortcut listener
-        self._bind_keys()
 
-        print("═" * 50)
-        print("  SYSTEM READY — All modules online")
-        print("  Keyboard: D=Demo  R=Reset  E=Cardiac  A=Accident  Q=Quit")
-        print("═" * 50)
+# ═══════════════════════════════════════
+# BACKGROUND LOGIC LOOP
+# ═══════════════════════════════════════
 
-    def _bind_keys(self):
-        self.dashboard.root.bind("<KeyPress-d>", lambda e: self._toggle_demo())
-        self.dashboard.root.bind("<KeyPress-D>", lambda e: self._toggle_demo())
-        self.dashboard.root.bind("<KeyPress-r>", lambda e: self._reset_all())
-        self.dashboard.root.bind("<KeyPress-R>", lambda e: self._reset_all())
-        self.dashboard.root.bind("<KeyPress-e>", lambda e: self._inject_cardiac())
-        self.dashboard.root.bind("<KeyPress-E>", lambda e: self._inject_cardiac())
-        self.dashboard.root.bind("<KeyPress-a>", lambda e: self._inject_accident())
-        self.dashboard.root.bind("<KeyPress-A>", lambda e: self._inject_accident())
-        self.dashboard.root.bind("<KeyPress-q>", lambda e: self._quit())
-        self.dashboard.root.bind("<KeyPress-Q>", lambda e: self._quit())
+def logic_loop(shared_state, vision_monitor, sensor_monitor, logic_controller, alert_system):
+    """Runs at 10Hz in a background thread. Updates shared_state for the dashboard."""
 
-    # ─── Keyboard actions ───
+    demo_cardiac_injected = False
+    demo_pre_cardiac_injected = False
 
-    def _toggle_demo(self):
-        self.demo_active = not self.demo_active
-        self.start_time = time.time()
-        self.demo_cardiac_injected = False
-        self.demo_pre_cardiac_injected = False
-        status = "ON" if self.demo_active else "OFF"
-        print(f"  >> DEMO MODE {status}")
-        if not self.demo_active:
-            self.dashboard.set_demo_stage("")
-
-    def _reset_all(self):
-        print("  >> RESET ALL ALERTS")
-        self.alerts._send_command_to_esp32("RESET")
-        self.alerts.cancel_active = False
-        self.alerts.cancel_remaining = 0
-        self.alerts.offence_count = 0
-        self.dashboard.safety_score = 100
-        self.dashboard.set_demo_stage("")
-        self.demo_active = False
-
-    def _inject_cardiac(self):
-        print("  >> INJECTING CARDIAC EMERGENCY")
-        self.sensors.inject_cardiac_emergency()
-
-    def _inject_accident(self):
-        print("  >> INJECTING ACCIDENT")
-        self.sensors.inject_accident()
-
-    def _quit(self):
-        self.shutdown()
-
-    # ─── Demo mode ───
-
-    def _get_demo_state(self, elapsed):
-        for start, end, label, vis_override, sensor_action in DEMO_STAGES:
-            if start <= elapsed < end:
-                return label, vis_override, sensor_action
-
-        # After all stages complete
-        return "DEMO COMPLETE", None, None
-
-    def demo_mode(self):
-        elapsed = time.time() - self.start_time
-        label, vis_override, sensor_action = self._get_demo_state(elapsed)
-
-        self.dashboard.set_demo_stage(f"DEMO: {label}")
-
-        # Handle sensor injections at appropriate stages
-        if sensor_action == "PRE_CARDIAC" and not self.demo_pre_cardiac_injected:
-            self.sensors.inject_cardiac_emergency()
-            self.demo_pre_cardiac_injected = True
-
-        if sensor_action == "CARDIAC" and not self.demo_cardiac_injected:
-            self.sensors.inject_cardiac_emergency()
-            self.demo_cardiac_injected = True
-
-        return vis_override
-
-    # ─── Main update loop (called at 10Hz by dashboard) ───
-
-    def update_loop(self, dashboard_ref):
+    while shared_state.get("running", True):
         try:
-            # Get vision status
-            vision_status = self.vision.get_status()
+            # ─── Read button triggers from dashboard ───
+            with shared_state["lock"]:
+                if shared_state.get("trigger_demo"):
+                    shared_state["demo_active"] = not shared_state.get("demo_active", False)
+                    shared_state["demo_start_time"] = time.time()
+                    shared_state["trigger_demo"] = False
+                    demo_cardiac_injected = False
+                    demo_pre_cardiac_injected = False
 
-            # Apply demo overrides
-            if self.demo_active:
-                override = self.demo_mode()
-                if override:
-                    vision_status = override
+                if shared_state.get("trigger_cardiac"):
+                    sensor_monitor.inject_cardiac_emergency()
+                    shared_state["trigger_cardiac"] = False
 
-            # Get sensor data
-            sensor_data = self.sensors.get_data()
+                if shared_state.get("trigger_accident"):
+                    sensor_monitor.inject_accident()
+                    shared_state["trigger_accident"] = False
 
-            # Brain classification
-            result = self.logic.classify(vision_status, sensor_data)
+                if shared_state.get("trigger_reset"):
+                    alert_system._send_command_to_esp32("RESET")
+                    alert_system.cancel_active = False
+                    alert_system.cancel_remaining = 0
+                    alert_system.offence_count = 0
+                    shared_state["safety_score"] = 100
+                    shared_state["demo_active"] = False
+                    shared_state["demo_stage"] = ""
+                    shared_state["trigger_reset"] = False
 
-            # Trigger alerts
-            self.alerts.handle(result, button_pressed=False)
+            # ─── Vision status ───
+            vision_status = vision_monitor.get_status()
 
-            # Update dashboard — sensors
-            dashboard_ref.update_sensors(sensor_data)
+            # ─── Demo mode override ───
+            demo_active = shared_state.get("demo_active", False)
+            if demo_active:
+                elapsed = time.time() - shared_state.get("demo_start_time", time.time())
+                label, vis_override, sensor_action = get_demo_state(elapsed)
 
-            # Update dashboard — vision metrics
-            dashboard_ref.update_vision_metrics(
-                perclos=self.vision.get_perclos(),
-                blink_rate=self.vision.get_blink_rate()
-            )
+                with shared_state["lock"]:
+                    shared_state["demo_stage"] = label
 
-            # Update dashboard — risk gauge
-            dashboard_ref.update_risk_gauge(
-                risk_score=result.get("risk_score", 0),
-                risk_level=result.get("risk_level", "NORMAL")
-            )
+                if vis_override:
+                    vision_status = vis_override
 
-            # Update dashboard — state + cancel countdown
-            dashboard_ref.update_state(
-                state=result["state"],
-                action=result["action_needed"],
-                cancel_remaining=self.alerts.cancel_remaining
-            )
+                if sensor_action == "PRE_CARDIAC" and not demo_pre_cardiac_injected:
+                    sensor_monitor.inject_cardiac_emergency()
+                    demo_pre_cardiac_injected = True
 
-            # Update dashboard — alert history
-            dashboard_ref.update_history(self.alerts.get_history())
+                if sensor_action == "CARDIAC" and not demo_cardiac_injected:
+                    sensor_monitor.inject_cardiac_emergency()
+                    demo_cardiac_injected = True
+            else:
+                with shared_state["lock"]:
+                    shared_state["demo_stage"] = ""
 
-            # Render camera frame
-            frame = self.vision.current_frame
-            if frame is not None:
-                dashboard_ref.set_camera_frame(frame)
+            # ─── Sensor data ───
+            sensor_data = sensor_monitor.get_data()
+
+            # ─── Logic classification ───
+            result = logic_controller.classify(vision_status, sensor_data)
+
+            # ─── Alerts ───
+            alert_system.handle(result, button_pressed=False)
+
+            # ─── Update shared state for dashboard ───
+            with shared_state["lock"]:
+                shared_state["vision_status"] = vision_status
+                shared_state["sensor_data"] = sensor_data
+                shared_state["logic_result"] = result
+                shared_state["cancel_remaining"] = alert_system.cancel_remaining
+                shared_state["alert_history"] = alert_system.get_history()
+
+                # Camera frame
+                frame = vision_monitor.current_frame
+                if frame is not None:
+                    shared_state["current_frame"] = frame.copy()
+
+                # Vision metrics
+                shared_state["perclos"] = vision_monitor.get_perclos()
+                shared_state["blink_rate"] = vision_monitor.get_blink_rate()
+                shared_state["avg_ear"] = getattr(vision_monitor, 'avg_ear', 0.0)
+                shared_state["head_angle"] = getattr(vision_monitor, 'head_angle', 0.0)
+
+                # Safety score
+                update_safety_score(shared_state, result.get("state", "NORMAL"))
 
         except Exception as e:
-            print(f"MAIN LOOP ERROR: {e}")
+            print(f"LOGIC LOOP ERROR: {e}")
             try:
                 with open("error_log.txt", "a") as f:
-                    f.write(f"MAIN LOOP ERROR: {str(e)}\n")
+                    f.write(f"LOGIC LOOP ERROR: {str(e)}\n")
             except Exception:
                 pass
 
-    def on_driver_cancel(self):
-        print("  >> Dashboard Cancel Button Pressed!")
-        dummy_result = {
-            "state": "NORMAL", "action_needed": "NONE",
-            "risk_score": 0, "risk_level": "NORMAL"
-        }
-        self.alerts.handle(dummy_result, button_pressed=True)
-
-    def run(self, enable_demo=False):
-        self.demo_active = enable_demo
-        try:
-            self.dashboard.mainloop()
-        except KeyboardInterrupt:
-            pass
-        self.shutdown()
-
-    def shutdown(self):
-        print("\n  Shutting down VitalDrive AI...")
-
-        if self.alerts:
-            self.alerts._send_command_to_esp32("RESET")
-            self.alerts.stop()
-
-        if self.vision:
-            self.vision.stop()
-
-        if self.sensors:
-            self.sensors.stop()
-
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            with open("alerts_log.txt", "a") as f:
-                f.write(f"\n[{timestamp}] SYSTEM STOPPED CLEANLY.\n")
-        except Exception:
-            pass
-
-        print("  Shutdown complete.")
-        sys.exit(0)
+        time.sleep(0.1)  # 10Hz
 
 
-if __name__ == "__main__":
-    app = AppSystem()
+# ═══════════════════════════════════════
+# INITIALIZATION (runs once per session)
+# ═══════════════════════════════════════
 
-    # Set to True for hackathon demo (automated 8-stage showcase)
-    DEMO_MODE_FLAG = True
+def initialize_system():
+    """Initialize all subsystems. Called once via st.session_state."""
 
-    app.run(enable_demo=DEMO_MODE_FLAG)
+    print("═" * 50)
+    print("   VITALDRIVE AI — INITIALIZING")
+    print("═" * 50)
+    print(f"  Simulation Mode : {config.SIMULATION_MODE}")
+    print(f"  Camera Mode     : {'ESP32-CAM' if config.USE_ESP32_CAM else 'LOCAL WEBCAM'}")
+    print(f"  Voice Enabled   : {config.VOICE_ENABLED}")
+    print("═" * 50)
+
+    # Shared state dictionary (thread-safe)
+    shared_state = {
+        "lock": threading.Lock(),
+        "running": True,
+        "vision_status": "NO_FACE",
+        "sensor_data": {},
+        "logic_result": {},
+        "cancel_remaining": 0,
+        "current_frame": None,
+        "alert_history": [],
+        "demo_stage": "",
+        "demo_active": False,
+        "demo_start_time": 0,
+        "perclos": 0.0,
+        "blink_rate": 0,
+        "avg_ear": 0.0,
+        "head_angle": 0.0,
+        "safety_score": 100,
+        "last_clean_time": time.time(),
+        # Dashboard button triggers
+        "trigger_demo": False,
+        "trigger_cardiac": False,
+        "trigger_accident": False,
+        "trigger_reset": False,
+    }
+
+    # Start sensors
+    print("  [1/4] Starting sensor thread...")
+    sensor_monitor = SensorMonitor()
+    sensor_monitor.start()
+    time.sleep(2)
+
+    # Start alerts (includes voice engine)
+    print("  [2/4] Starting alert system...")
+    alert_system = AlertSystem(serial_interface=None)
+
+    # Start vision
+    print("  [3/4] Starting camera/vision thread...")
+    vision_monitor = VisionMonitor()
+    vision_monitor.start()
+    time.sleep(1)
+
+    # Start logic loop
+    print("  [4/4] Starting logic loop...")
+    logic_controller = LogicController()
+    logic_thread = threading.Thread(
+        target=logic_loop,
+        args=(shared_state, vision_monitor, sensor_monitor, logic_controller, alert_system),
+        daemon=True
+    )
+    logic_thread.start()
+
+    print("═" * 50)
+    print("  SYSTEM READY — All modules online")
+    print("═" * 50)
+
+    return shared_state, vision_monitor, sensor_monitor, alert_system
+
+
+# ═══════════════════════════════════════
+# STREAMLIT ENTRY POINT
+# ═══════════════════════════════════════
+
+# Initialize once per session
+if "initialized" not in st.session_state:
+    shared_state, vision_monitor, sensor_monitor, alert_system = initialize_system()
+    st.session_state.initialized = True
+    st.session_state.shared_state = shared_state
+    st.session_state.vision_monitor = vision_monitor
+    st.session_state.sensor_monitor = sensor_monitor
+    st.session_state.alert_system = alert_system
+
+# Auto-refresh every 1 second
+st_autorefresh(interval=1000, key="vitaldrive_refresh")
+
+# Render the dashboard
+render_dashboard(st.session_state.shared_state)

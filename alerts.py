@@ -1,4 +1,5 @@
 import time
+import math
 import datetime
 import requests
 from twilio.rest import Client
@@ -6,18 +7,19 @@ from twilio.rest import Client
 import config
 from voice import VoiceAlert
 
+
 class AlertSystem:
     def __init__(self, serial_interface=None):
         self.serial = serial_interface
 
-        # Twilio setup
-        if config.TWILIO_SID != "your_sid" and config.TWILIO_TOKEN != "your_token":
-            try:
+        # Twilio setup (reads from config.py)
+        self.twilio = None
+        try:
+            if (hasattr(config, 'TWILIO_SID') and config.TWILIO_SID != "your_sid" and
+                hasattr(config, 'TWILIO_TOKEN') and config.TWILIO_TOKEN != "your_token"):
                 self.twilio = Client(config.TWILIO_SID, config.TWILIO_TOKEN)
-            except Exception as e:
-                self._log(f"Twilio Initialization Error: {e}")
-                self.twilio = None
-        else:
+        except Exception as e:
+            self._log(f"Twilio Initialization Error: {e}")
             self.twilio = None
 
         # Voice engine
@@ -25,27 +27,27 @@ class AlertSystem:
         self.voice.start()
 
         # SMS throttle
-        self.last_sms_time = 0
-        self.last_warning_sms_time = 0
+        self.last_sms_time = 0.0
+        self.last_warning_sms_time = 0.0
 
         # Cancel window
-        self.cancel_countdown_start = 0
+        self.cancel_countdown_start = 0.0
         self.cancel_active = False
         self.cancel_remaining = 0
 
         # Escalating alert pattern
         self.offence_count = 0
-        self.offence_window_start = 0
+        self.offence_window_start = 0.0
         self.offence_window = 300  # 5 minutes
 
         # Buzzer command throttle (prevents spam)
-        self.last_command = None
-        self.last_command_time = 0
+        self.last_command = ""
+        self.last_command_time = 0.0
         self.command_cooldown = 3  # seconds between identical commands
 
         # State handling throttle
-        self.last_handled_state = None
-        self.last_handle_time = 0
+        self.last_handled_state = ""
+        self.last_handle_time = 0.0
         self.handle_cooldown = 3  # seconds between re-handling same state
 
         # Alert history (for dashboard)
@@ -62,14 +64,20 @@ class AlertSystem:
         except Exception:
             pass
 
-    def _add_history(self, message):
+    def _add_history(self, message, result=None):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        self.alert_history.append((timestamp, message))
+        entry = {"timestamp": timestamp, "message": message}
+        if result:
+            entry["state"] = result.get("state", "")
+            entry["hr"] = result.get("hr", 0)
+            entry["spo2"] = result.get("spo2", 0)
+            entry["action"] = result.get("action_needed", "")
+        self.alert_history.append(entry)
         if len(self.alert_history) > self.max_history:
             self.alert_history = self.alert_history[-self.max_history:]
 
     def get_history(self):
-        return list(self.alert_history[-5:])  # last 5 for dashboard
+        return list(self.alert_history[-10:])  # last 10 for dashboard table
 
     def _send_command_to_esp32(self, cmd):
         now = time.time()
@@ -88,45 +96,75 @@ class AlertSystem:
                 self._log(f"Failed to send to ESP32: {e}")
         self._log(f"COMMAND to ESP32: {cmd}")
 
-    # ─── Smart Hospital Selection ───
+    # ═══════════════════════════════════════
+    # Overpass API Hospital Finder (from comp.py)
+    # ═══════════════════════════════════════
 
-    def _get_nearest_hospitals(self, lat, lng, count=3):
+    @staticmethod
+    def _haversine(lat1, lon1, lat2, lon2):
+        R = 6371  # Earth radius in km
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = (math.sin(dlat / 2) ** 2 +
+             math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+             math.sin(dlon / 2) ** 2)
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        return round(R * c, 2)
+
+    def _find_hospitals(self, lat, lng, count=3):
+        """Uses Overpass API to find nearest hospitals — more accurate than Nominatim."""
         hospitals = []
         try:
-            url = (
-                f"https://nominatim.openstreetmap.org/search.php"
-                f"?q=hospital&format=jsonv2&lat={lat}&lon={lng}&limit={count}"
-            )
-            headers = {'User-Agent': 'VitalDriveApp/1.0 (Student Hackathon Project)'}
-            response = requests.get(url, headers=headers, timeout=5)
+            overpass_url = "https://overpass-api.de/api/interpreter"
+            query = f"""
+            [out:json];
+            (
+              node["amenity"="hospital"](around:20000,{lat},{lng});
+              way["amenity"="hospital"](around:20000,{lat},{lng});
+              relation["amenity"="hospital"](around:20000,{lat},{lng});
+            );
+            out center;
+            """
+            response = requests.get(overpass_url, params={"data": query}, timeout=10)
 
             if response.status_code == 200:
                 data = response.json()
-                for entry in data[:count]:
-                    name = entry.get('display_name', 'Unknown Hospital').split(',')[0]
-                    h_lat = float(entry['lat'])
-                    h_lon = float(entry['lon'])
-                    dist = ((lat - h_lat)**2 + (lng - h_lon)**2)**0.5 * 111
-                    hospitals.append((name, round(dist, 1)))
+                elements = data.get("elements", [])
+
+                for el in elements:
+                    # For ways/relations, coordinates are in 'center'
+                    h_lat = el.get("lat") or el.get("center", {}).get("lat")
+                    h_lon = el.get("lon") or el.get("center", {}).get("lon")
+                    name = el.get("tags", {}).get("name", "Unknown Hospital")
+
+                    if h_lat and h_lon:
+                        dist = self._haversine(lat, lng, h_lat, h_lon)
+                        hospitals.append((name, dist, h_lat, h_lon))
+
+                # Sort by distance, pick top N
+                hospitals.sort(key=lambda x: x[1])
+                hospitals = hospitals[:count]
 
         except Exception as e:
-            self._log(f"OSM API Error: {e}")
+            self._log(f"Overpass API Error: {e}")
 
         if not hospitals:
-            hospitals = [("Nearest Hospital", 0.0)]
+            hospitals = [("Nearest Hospital", 0.0, lat, lng)]
 
-        # Sort by distance and return
-        hospitals.sort(key=lambda x: x[1])
         return hospitals
 
-    # ─── SMS ───
+    # ═══════════════════════════════════════
+    # SMS Sender
+    # ═══════════════════════════════════════
 
     def _send_sms(self, to_number, body):
         self._log(f"Sending SMS to {to_number}:\n{body}")
         if self.twilio:
             try:
                 message = self.twilio.messages.create(
-                    body=body, from_=config.TWILIO_FROM, to=to_number
+                    body=body,
+                    from_=config.TWILIO_FROM,
+                    to=to_number
                 )
                 self._log(f"SMS Sent! SID: {message.sid}")
             except Exception as e:
@@ -138,36 +176,27 @@ class AlertSystem:
 
     def _track_offence(self):
         now = time.time()
-
-        # Reset window after 5 minutes of no offences
         if now - self.offence_window_start > self.offence_window:
             self.offence_count = 0
             self.offence_window_start = now
-
         self.offence_count += 1
         return self.offence_count
 
     def _get_escalation_level(self, base_action):
         count = self._track_offence()
-
         if count >= 3:
-            # Third offence within 5 min → emergency mode
-            if "SOFT" in base_action:
-                return "BUZZ_LOUD"
-            elif "MEDIUM" in base_action:
-                return "BUZZ_MAX"
+            if "SOFT" in base_action: return "BUZZ_LOUD"
+            elif "MEDIUM" in base_action: return "BUZZ_MAX"
             return base_action
         elif count >= 2:
-            # Second offence → louder + voice
-            if "SOFT" in base_action:
-                return "BUZZ_MEDIUM"
-            elif "MEDIUM" in base_action:
-                return "BUZZ_LOUD"
+            if "SOFT" in base_action: return "BUZZ_MEDIUM"
+            elif "MEDIUM" in base_action: return "BUZZ_LOUD"
             return base_action
-        else:
-            return base_action
+        return base_action
 
-    # ─── Main handler ───
+    # ═══════════════════════════════════════
+    # Main Handler
+    # ═══════════════════════════════════════
 
     def handle(self, classification_result, button_pressed=False):
         state = classification_result.get("state", "NORMAL")
@@ -178,7 +207,7 @@ class AlertSystem:
         # ─── Cancel window logic ───
         if button_pressed and self.cancel_active:
             self._log("ALERT CANCELLED BY DRIVER (Button Pressed)")
-            self._add_history("ALERT CANCELLED")
+            self._add_history("ALERT CANCELLED", classification_result)
             self._send_command_to_esp32("RESET")
             self.cancel_active = False
             self.cancel_remaining = 0
@@ -190,7 +219,7 @@ class AlertSystem:
 
             if elapsed >= config.CANCEL_WINDOW_SECONDS:
                 self._log("CANCEL WINDOW EXPIRED - ESCALATING")
-                self._add_history("CANCEL EXPIRED - ESCALATING")
+                self._add_history("CANCEL EXPIRED - ESCALATING", classification_result)
                 self.cancel_active = False
                 self.cancel_remaining = 0
 
@@ -220,7 +249,7 @@ class AlertSystem:
             self.cancel_countdown_start = time.time()
             self.cancel_remaining = config.CANCEL_WINDOW_SECONDS
             self._log(f"STARTING {config.CANCEL_WINDOW_SECONDS}s CANCELLATION COUNTDOWN")
-            self._add_history(f"{state} - {config.CANCEL_WINDOW_SECONDS}s COUNTDOWN")
+            self._add_history(f"{state} - {config.CANCEL_WINDOW_SECONDS}s COUNTDOWN", classification_result)
             self._send_command_to_esp32("BUZZ_LOUD")
             self.voice.speak(state)
             return
@@ -229,19 +258,19 @@ class AlertSystem:
         if action == "SOFT_BUZZER":
             escalated = self._get_escalation_level("BUZZ_SOFT")
             self._send_command_to_esp32(escalated)
-            self._add_history(f"{state} detected")
+            self._add_history(f"{state} detected", classification_result)
             self.voice.speak(state)
 
         elif action == "MEDIUM_BUZZER":
             escalated = self._get_escalation_level("BUZZ_MEDIUM")
             self._send_command_to_esp32(escalated)
-            self._add_history(f"{state} detected")
+            self._add_history(f"{state} detected", classification_result)
             self.voice.speak(state)
 
         elif "MAX_BUZZER" in action:
             self._send_command_to_esp32("BUZZ_MAX")
             self._send_command_to_esp32("VIBRATE_MAX")
-            self._add_history(f"{state} - MAX ALERT")
+            self._add_history(f"{state} - MAX ALERT", classification_result)
             self.voice.speak(state)
 
         # ─── Pre-Emergency Warning SMS (risk score 7-8) ───
@@ -257,7 +286,7 @@ class AlertSystem:
                     f"Location: https://maps.google.com/?q={lat},{lng}"
                 )
                 self._send_sms(config.EMERGENCY_CONTACT, body)
-                self._add_history("WARNING SMS sent to contact")
+                self._add_history("WARNING SMS sent to contact", classification_result)
                 self.last_warning_sms_time = current_time
 
         # ─── Emergency SMS (throttled: 5 min cooldown) ───
@@ -272,10 +301,11 @@ class AlertSystem:
         spo2 = classification_result.get("spo2", 0)
 
         if state == "CARDIAC_EMERGENCY":
-            hospitals = self._get_nearest_hospitals(lat, lng, count=3)
+            hospitals = self._find_hospitals(lat, lng, count=3)
             primary = hospitals[0]
-            hospital_lines = "\n".join([f"  {i+1}. {h[0]} ({h[1]}km)" for i, h in enumerate(hospitals)])
-
+            hospital_lines = "\n".join(
+                [f"  {i+1}. {h[0]} ({h[1]}km)" for i, h in enumerate(hospitals)]
+            )
             body = (
                 f"CARDIAC EMERGENCY - VitalDrive Alert\n"
                 f"Patient: Driver\n"
@@ -287,14 +317,15 @@ class AlertSystem:
             )
             self._send_sms(config.HOSPITAL_CONTACT, body)
             self._send_sms(config.EMERGENCY_CONTACT, body)
-            self._add_history("CARDIAC EMERGENCY - SMS sent")
+            self._add_history("CARDIAC EMERGENCY - SMS sent", classification_result)
             self.voice.speak(state)
             self.last_sms_time = current_time
 
         elif state in ["ACCIDENT", "CARDIAC_CAUSED_CRASH"]:
-            hospitals = self._get_nearest_hospitals(lat, lng, count=3)
-            hospital_lines = "\n".join([f"  {i+1}. {h[0]} ({h[1]}km)" for i, h in enumerate(hospitals)])
-
+            hospitals = self._find_hospitals(lat, lng, count=3)
+            hospital_lines = "\n".join(
+                [f"  {i+1}. {h[0]} ({h[1]}km)" for i, h in enumerate(hospitals)]
+            )
             body = (
                 f"CRASH EMERGENCY - VitalDrive Alert\n"
                 f"High impact detected\n"
@@ -304,14 +335,15 @@ class AlertSystem:
                 f"Time: {timestamp}"
             )
             self._send_sms(config.EMERGENCY_CONTACT, body)
-            self._add_history("CRASH EMERGENCY - SMS sent")
+            self._add_history("CRASH EMERGENCY - SMS sent", classification_result)
             self.voice.speak(state)
             self.last_sms_time = current_time
 
         elif state == "MEDICAL_SHOCK":
-            hospitals = self._get_nearest_hospitals(lat, lng, count=3)
-            hospital_lines = "\n".join([f"  {i+1}. {h[0]} ({h[1]}km)" for i, h in enumerate(hospitals)])
-
+            hospitals = self._find_hospitals(lat, lng, count=3)
+            hospital_lines = "\n".join(
+                [f"  {i+1}. {h[0]} ({h[1]}km)" for i, h in enumerate(hospitals)]
+            )
             body = (
                 f"CRITICAL MEDICAL SHOCK - VitalDrive Alert\n"
                 f"Driver vitals crashed below critical limits.\n"
@@ -322,20 +354,21 @@ class AlertSystem:
             )
             self._send_sms(config.HOSPITAL_CONTACT, body)
             self._send_sms(config.EMERGENCY_CONTACT, body)
-            self._add_history("MEDICAL SHOCK - SMS sent")
+            self._add_history("MEDICAL SHOCK - SMS sent", classification_result)
             self.voice.speak(state)
             self.last_sms_time = current_time
 
         elif state == "DRIVER_ASLEEP":
             self._log("Calling Emergency Contact... (Simulated Phone Call)")
-            self._add_history("DRIVER ASLEEP - Calling contact")
+            self._add_history("DRIVER ASLEEP - Calling contact", classification_result)
             self.voice.speak(state)
             self.last_sms_time = current_time
 
         elif state == "RISK_EMERGENCY":
-            hospitals = self._get_nearest_hospitals(lat, lng, count=3)
-            hospital_lines = "\n".join([f"  {i+1}. {h[0]} ({h[1]}km)" for i, h in enumerate(hospitals)])
-
+            hospitals = self._find_hospitals(lat, lng, count=3)
+            hospital_lines = "\n".join(
+                [f"  {i+1}. {h[0]} ({h[1]}km)" for i, h in enumerate(hospitals)]
+            )
             body = (
                 f"RISK EMERGENCY - VitalDrive Alert\n"
                 f"Multiple risk factors detected simultaneously.\n"
@@ -347,7 +380,7 @@ class AlertSystem:
             )
             self._send_sms(config.HOSPITAL_CONTACT, body)
             self._send_sms(config.EMERGENCY_CONTACT, body)
-            self._add_history("RISK EMERGENCY - SMS sent")
+            self._add_history("RISK EMERGENCY - SMS sent", classification_result)
             self.last_sms_time = current_time
 
     def stop(self):
