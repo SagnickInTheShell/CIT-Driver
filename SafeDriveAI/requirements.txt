@@ -4,3 +4,4 @@ numpy
 scipy
 pyttsx3
 fpdf2
+pyserial
