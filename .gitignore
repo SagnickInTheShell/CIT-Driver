@@ -13,3 +13,4 @@ error_log.txt
 # IDEs
 .vscode/
 .idea/
+SafeDriveAI/venv/
